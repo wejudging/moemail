@@ -33,9 +33,7 @@ jobs:
           cache: 'pnpm'
 
       - name: Install Dependencies
-        run: |
-          pnpm install --frozen-lockfile
-          npm install --save-dev wrangler@4
+        run: pnpm install --frozen-lockfile
 
       - name: Run deploy script
         env:
