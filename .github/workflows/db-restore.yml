@@ -43,8 +43,6 @@ jobs:
           tables_input = os.environ.get('TABLES', '').strip()
           target_tables = [t.strip().strip('"') for t in tables_input.split(',') if t.strip()] if tables_input else []
           batch_size = int(os.environ.get('BATCH_SIZE', '200'))
-
-          # D1 实际单条限制约 100KB
           MAX_STMT_BYTES = 100_000
 
           content = open('./backup.sql', encoding='utf-8', errors='replace').read()
@@ -54,22 +52,6 @@ jobs:
           counts = {}
           skipped = 0
           fallback_ts = int(time.time() * 1000)
-
-          # 先统计语句大小分布
-          msg_sizes = []
-          for stmt in statements:
-              stmt = stmt.strip()
-              if re.match(r'INSERT INTO\s+"?message"?\s', stmt, re.IGNORECASE):
-                  msg_sizes.append(len(stmt.encode('utf-8')))
-          if msg_sizes:
-              msg_sizes.sort()
-              print(f"message 语句大小分布:")
-              print(f"  最小: {msg_sizes[0]//1024}KB")
-              print(f"  中位: {msg_sizes[len(msg_sizes)//2]//1024}KB")
-              print(f"  最大: {msg_sizes[-1]//1024}KB")
-              print(f"  超过100KB的: {sum(1 for s in msg_sizes if s > MAX_STMT_BYTES)} 条")
-              print(f"  超过500KB的: {sum(1 for s in msg_sizes if s > 500_000)} 条")
-              print(f"  超过1MB的:   {sum(1 for s in msg_sizes if s > 1_000_000)} 条")
 
           for stmt in statements:
               stmt = stmt.strip()
@@ -97,8 +79,7 @@ jobs:
                       fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
                       stmt = re.sub(r'\bNULL\b', fill_val, stmt)
 
-              stmt_bytes = len(stmt.encode('utf-8'))
-              if stmt_bytes > MAX_STMT_BYTES:
+              if len(stmt.encode('utf-8')) > MAX_STMT_BYTES:
                   skipped += 1
                   continue
 
@@ -116,7 +97,7 @@ jobs:
                   f.write(f'-- restore-id: {uuid.uuid4()} batch {i+1}/{num_batches}\n')
                   f.writelines(chunk)
 
-          print(f"\n恢复范围: {'全部表' if not target_tables else ', '.join(target_tables)}")
+          print(f"恢复范围: {'全部表' if not target_tables else ', '.join(target_tables)}")
           for t, c in sorted(counts.items()):
               print(f"  {t}: {c} 条")
           print(f"合计: {total} 条，分 {num_batches} 批（每批 {batch_size} 条）")
@@ -142,6 +123,7 @@ jobs:
             echo "📦 正在导入第 $i/$TOTAL 批: $batch_file"
             wrangler d1 execute "$DB_NAME" --remote --file "$batch_file"
             echo "✅ 第 $i 批完成"
+            sleep 3
           done
 
           echo "🎉 全部恢复完成"
