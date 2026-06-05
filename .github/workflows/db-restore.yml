@@ -1,5 +1,4 @@
 name: ♻️ Restore D1 Database
-
 on:
   workflow_dispatch:
     inputs:
@@ -7,14 +6,11 @@ on:
         description: '备份任务的 Run ID（在备份 workflow 的 Summary 页查看）'
         required: true
         type: string
-
 permissions:
   actions: read
-
 jobs:
   restore:
     runs-on: ubuntu-latest
-
     steps:
       - name: Download backup artifact
         uses: actions/download-artifact@v4
@@ -22,15 +18,18 @@ jobs:
           name: d1-backup
           run-id: ${{ inputs.backup_run_id }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-
       - name: Decompress backup
         run: |
           gunzip ./backup.sql.gz
-          echo "📄 待恢复数据: $(wc -l < ./backup.sql) 行"
-
+          echo "📄 备份总行数: $(wc -l < ./backup.sql) 行"
+      - name: Extract message table
+        run: |
+          grep -i 'INSERT INTO.*["`]message["`]' ./backup.sql \
+            | sed 's/INSERT INTO/INSERT OR REPLACE INTO/gi' \
+            > ./restore_target.sql
+          echo "📄 message 表记录数: $(wc -l < ./restore_target.sql) 行"
       - name: Install Wrangler
         run: npm install -g wrangler@4
-
       - name: Restore database
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
@@ -38,7 +37,6 @@ jobs:
         run: |
           DB_NAME="${{ secrets.DATABASE_NAME }}"
           DB_NAME="${DB_NAME:-mail}"
-
-          echo "♻️ 正在恢复数据库: $DB_NAME"
-          wrangler d1 execute "$DB_NAME" --remote --file ./backup.sql
-          echo "✅ 数据恢复完成"
+          echo "♻️ 正在恢复 message 表: $DB_NAME"
+          wrangler d1 execute "$DB_NAME" --remote --file ./restore_target.sql
+          echo "✅ message 表恢复完成"
