@@ -12,7 +12,7 @@ on:
         type: string
         default: ''
       batch_size:
-        description: '每批导入的语句数（默认200，超时可调小）'
+        description: '每批导入的语句数（默认200）'
         required: false
         type: string
         default: '200'
@@ -94,7 +94,6 @@ jobs:
               chunk = all_stmts[i*batch_size:(i+1)*batch_size]
               batch_file = f'./batches/batch_{i+1:04d}.sql'
               with open(batch_file, 'w', encoding='utf-8') as f:
-                  f.write(f'-- restore-id: {uuid.uuid4()} batch {i+1}/{num_batches}\n')
                   f.writelines(chunk)
 
           print(f"恢复范围: {'全部表' if not target_tables else ', '.join(target_tables)}")
@@ -105,25 +104,43 @@ jobs:
               print(f"⚠️  跳过超长记录: {skipped} 条")
           PYEOF
 
-      - name: Install Wrangler
-        run: npm install -g wrangler@4
-      - name: Restore database in batches
+      - name: Restore via Cloudflare API
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DATABASE_ID: ${{ secrets.DATABASE_ID }}
         run: |
-          DB_NAME="${{ secrets.DATABASE_NAME }}"
-          DB_NAME="${DB_NAME:-mail}"
           TOTAL=$(ls ./batches/batch_*.sql | wc -l)
-          echo "♻️ 开始恢复数据库: $DB_NAME，共 $TOTAL 批"
+          echo "♻️ 开始恢复，共 $TOTAL 批"
 
           i=0
           for batch_file in $(ls ./batches/batch_*.sql | sort); do
             i=$((i+1))
             echo "📦 正在导入第 $i/$TOTAL 批: $batch_file"
-            wrangler d1 execute "$DB_NAME" --remote --file "$batch_file"
+
+            RESPONSE=$(curl -s -w "\n%{http_code}" \
+              -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database/${DATABASE_ID}/query" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"sql\": $(python3 -c "import json,sys; print(json.dumps(open('$batch_file').read()))")}")
+
+            HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+            BODY=$(echo "$RESPONSE" | head -1)
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              echo "❌ 第 $i 批失败 (HTTP $HTTP_CODE): $BODY"
+              exit 1
+            fi
+
+            SUCCESS=$(echo "$BODY" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('success', False))")
+            if [ "$SUCCESS" != "True" ]; then
+              echo "❌ 第 $i 批 API 返回失败: $BODY"
+              exit 1
+            fi
+
             echo "✅ 第 $i 批完成"
-            sleep 3
+            sleep 1
           done
 
           echo "🎉 全部恢复完成"
