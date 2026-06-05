@@ -38,7 +38,7 @@ jobs:
           BATCH_SIZE: ${{ inputs.batch_size }}
         run: |
           python3 - <<'PYEOF'
-          import re, uuid, os, math
+          import re, uuid, os, math, time
 
           tables_input = os.environ.get('TABLES', '').strip()
           target_tables = [t.strip().strip('"') for t in tables_input.split(',') if t.strip()] if tables_input else []
@@ -49,6 +49,7 @@ jobs:
 
           all_stmts = []
           counts = {}
+          fallback_ts = int(time.time() * 1000)
 
           for stmt in statements:
               stmt = stmt.strip()
@@ -65,12 +66,11 @@ jobs:
 
               stmt = re.sub(r'^INSERT INTO', 'INSERT OR REPLACE INTO', stmt, flags=re.IGNORECASE)
 
-              # 修复 message.sent_at 为 NULL，用 received_at 时间戳填充
+              # 修复 message 表所有 NULL 值：优先用 received_at，兜底用当前时间戳
               if table_name == 'message':
-                  received_at_match = re.search(r',(\d{13}),', stmt)
-                  if received_at_match:
-                      received_at_val = received_at_match.group(1)
-                      stmt = re.sub(r'\bNULL\b', received_at_val, stmt)
+                  received_at_match = re.search(r',(\d{13})[,)]', stmt)
+                  fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
+                  stmt = re.sub(r'\bNULL\b', fill_val, stmt)
 
               all_stmts.append(stmt + ';\n')
               counts[table_name] = counts.get(table_name, 0) + 1
