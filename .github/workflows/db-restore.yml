@@ -1,0 +1,44 @@
+name: ♻️ Restore D1 Database
+
+on:
+  workflow_dispatch:
+    inputs:
+      backup_run_id:
+        description: '备份任务的 Run ID（在备份 workflow 的 Summary 页查看）'
+        required: true
+        type: string
+
+permissions:
+  actions: read
+
+jobs:
+  restore:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download backup artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: d1-backup
+          run-id: ${{ inputs.backup_run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decompress backup
+        run: |
+          gunzip ./backup.sql.gz
+          echo "📄 待恢复数据: $(wc -l < ./backup.sql) 行"
+
+      - name: Install Wrangler
+        run: npm install -g wrangler@4
+
+      - name: Restore database
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          DB_NAME="${{ secrets.DATABASE_NAME }}"
+          DB_NAME="${DB_NAME:-mail}"
+
+          echo "♻️ 正在恢复数据库: $DB_NAME"
+          wrangler d1 execute "$DB_NAME" --remote --file ./backup.sql
+          echo "✅ 数据恢复完成"

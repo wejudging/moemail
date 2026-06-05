@@ -1,0 +1,54 @@
+name: 🗄️ Backup D1 Database
+
+on:
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Install Wrangler
+        run: npm install -g wrangler@4
+
+      - name: Export database
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          DB_NAME="${{ secrets.DATABASE_NAME }}"
+          DB_NAME="${DB_NAME:-mail}"
+
+          echo "📦 正在导出数据库: $DB_NAME"
+          wrangler d1 export "$DB_NAME" --remote --output ./backup-full.sql
+
+          echo "✂️ 过滤：只保留 INSERT 语句，排除系统表..."
+          grep -E "^INSERT INTO" ./backup-full.sql \
+            | grep -v '"d1_migrations"' \
+            | grep -v '"sqlite_sequence"' \
+            > ./backup.sql || true
+
+          echo "✅ 导出完成，共 $(wc -l < ./backup.sql) 行数据"
+          echo "   原始大小: $(du -sh backup-full.sql | cut -f1)"
+
+      - name: Compress backup
+        run: |
+          gzip -c ./backup.sql > ./backup.sql.gz
+          echo "🗜️ 压缩后大小: $(du -sh backup.sql.gz | cut -f1)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: d1-backup
+          path: ./backup.sql.gz
+          retention-days: 7
+
+      - name: Print summary
+        run: |
+          echo "## ✅ 备份完成" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "恢复数据时，在 Restore 工作流中填写以下 Run ID：" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### \`${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> artifact 保留 7 天，请尽快完成后续操作。" >> $GITHUB_STEP_SUMMARY
