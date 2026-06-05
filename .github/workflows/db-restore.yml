@@ -22,14 +22,34 @@ jobs:
         run: |
           gunzip ./backup.sql.gz
           echo "📄 备份总行数: $(wc -l < ./backup.sql) 行"
-      - name: Extract message table
+      - name: Extract and fix message table
         run: |
           CURRENT_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
+          # 提取 message 表，替换 INSERT，用 Python 精确处理 sent_at NULL
           grep -i 'INSERT INTO.*["`]message["`]' ./backup.sql \
             | sed 's/INSERT INTO/INSERT OR REPLACE INTO/gi' \
-            | sed "s/,NULL,/,'${CURRENT_TIME}',/g" \
-            > ./restore_target.sql
-          echo "📄 message 表记录数: $(wc -l < ./restore_target.sql) 行"
+            > ./message_raw.sql
+
+          python3 - <<PYEOF
+          import re, datetime
+
+          current_time = datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+          lines = open('./message_raw.sql').readlines()
+          fixed = []
+          for line in lines:
+              # 将值列表中的 NULL 替换为时间字符串（针对 sent_at 可能为 NULL 的情况）
+              # 用正则精准匹配独立的 NULL token
+              fixed_line = re.sub(r'(?<![\'"\w])NULL(?![\'"\w])', f"'{current_time}'", line)
+              fixed.append(fixed_line)
+
+          # 加随机注释打破 wrangler 文件缓存（基于内容哈希）
+          import uuid
+          fixed.insert(0, f'-- restore-id: {uuid.uuid4()}\n')
+          open('./restore_target.sql', 'w').writelines(fixed)
+          print(f"处理完成，共 {len(fixed)-1} 条记录")
+          PYEOF
+
+          echo "📄 message 表记录数: $(( $(wc -l < ./restore_target.sql) - 1 )) 行"
       - name: Install Wrangler
         run: npm install -g wrangler@4
       - name: Restore database
