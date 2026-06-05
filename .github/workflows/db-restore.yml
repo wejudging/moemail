@@ -118,12 +118,19 @@ jobs:
             i=$((i+1))
             echo "📦 正在导入第 $i/$TOTAL 批: $batch_file"
 
+            python3 -c "
+import json
+sql = open('$batch_file', encoding='utf-8').read()
+with open('/tmp/payload.json', 'w') as f:
+    json.dump({'sql': sql}, f)
+"
+
             RESPONSE=$(curl -s -w "\n%{http_code}" \
               -X POST \
               "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/d1/database/${DATABASE_ID}/query" \
               -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
               -H "Content-Type: application/json" \
-              -d "{\"sql\": $(python3 -c "import json,sys; print(json.dumps(open('$batch_file').read()))")}")
+              --data-binary @/tmp/payload.json)
 
             HTTP_CODE=$(echo "$RESPONSE" | tail -1)
             BODY=$(echo "$RESPONSE" | head -1)
