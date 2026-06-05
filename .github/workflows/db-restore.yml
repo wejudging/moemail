@@ -22,54 +22,53 @@ jobs:
         run: |
           gunzip ./backup.sql.gz
           echo "📄 备份总行数: $(wc -l < ./backup.sql) 行"
-      - name: Extract and fix message table
+      - name: Extract and fix email + message tables
         run: |
           python3 - <<'PYEOF'
           import re, uuid
 
-          lines = open('./backup.sql').readlines()
-          fixed = [f'-- restore-id: {uuid.uuid4()}\n']
-          count = 0
+          content = open('./backup.sql', encoding='utf-8', errors='replace').read()
 
-          for line in lines:
-              if not re.search(r'INSERT INTO.*message', line, re.IGNORECASE):
+          # 按语句分割（以 ; 结尾，支持多行语句）
+          statements = re.split(r';\s*\n', content)
+
+          fixed = [f'-- restore-id: {uuid.uuid4()}\n']
+          email_count = 0
+          message_count = 0
+
+          for stmt in statements:
+              stmt = stmt.strip()
+              if not stmt:
+                  continue
+
+              is_email = bool(re.match(r'INSERT INTO\s+"?email"?\s', stmt, re.IGNORECASE))
+              is_message = bool(re.match(r'INSERT INTO\s+"?message"?\s', stmt, re.IGNORECASE))
+
+              if not is_email and not is_message:
                   continue
 
               # INSERT OR REPLACE
-              line = re.sub(r'INSERT INTO', 'INSERT OR REPLACE INTO', line, flags=re.IGNORECASE)
+              stmt = re.sub(r'^INSERT INTO', 'INSERT OR REPLACE INTO', stmt, flags=re.IGNORECASE)
 
-              # 在列名列表里追加 "sent_at"
-              # 匹配 ("id","emailId",..."html") 这段列名部分
-              line = re.sub(
-                  r'("html")\s*\)',
-                  r'\1,"sent_at")',
-                  line
-              )
+              if is_message:
+                  # 补 sent_at 列（旧备份没有这列）
+                  if '"sent_at"' not in stmt:
+                      stmt = re.sub(r'("html")\s*\)', r'\1,"sent_at")', stmt)
+                      received_at_match = re.search(r',(\d{13}),', stmt)
+                      if received_at_match:
+                          received_at_val = received_at_match.group(1)
+                          stmt = re.sub(r'\)\s*$', f',{received_at_val})', stmt)
+                  message_count += 1
+              else:
+                  email_count += 1
 
-              # 在 VALUES 里每行末尾的最后一个 ) 前，插入 received_at 的值作为 sent_at
-              # received_at 是数字时间戳，sent_at 也用同样的值
-              # 先提取 received_at 的值（第6个值）
-              m = re.search(r'VALUES\s*\(', line)
-              if m:
-                  # 用正则从值列表里取 received_at（倒数第2个值，html前）
-                  # 结构：VALUES('id','emailId','from','subject',content_expr,received_at,'html_expr')
-                  # received_at 是纯数字
-                  received_at_match = re.search(r',(\d{13}),', line)
-                  if received_at_match:
-                      received_at_val = received_at_match.group(1)
-                      # 在最后一个 ); 前插入 sent_at 值
-                      line = re.sub(r'\);\s*$', f',{received_at_val});', line)
+              fixed.append(stmt + ';\n')
 
-              fixed.append(line)
-              count += 1
-
-          open('./restore_target.sql', 'w').writelines(fixed)
-          print(f"处理完成，共 {count} 条记录")
+          open('./restore_target.sql', 'w', encoding='utf-8').writelines(fixed)
+          print(f"email 表: {email_count} 条，message 表: {message_count} 条，共 {email_count + message_count} 条")
           PYEOF
 
-          echo "📄 message 表记录数: $(( $(wc -l < ./restore_target.sql) - 1 )) 行"
-          echo "=== 替换后第2条（验证列名和值）==="
-          sed -n '2p' ./restore_target.sql | cut -c1-300
+          echo "📄 待恢复语句总数: $(( $(wc -l < ./restore_target.sql) - 1 )) 行"
       - name: Install Wrangler
         run: npm install -g wrangler@4
       - name: Restore database
@@ -79,6 +78,6 @@ jobs:
         run: |
           DB_NAME="${{ secrets.DATABASE_NAME }}"
           DB_NAME="${DB_NAME:-mail}"
-          echo "♻️ 正在恢复 message 表: $DB_NAME"
+          echo "♻️ 正在恢复 email + message 表: $DB_NAME"
           wrangler d1 execute "$DB_NAME" --remote --file ./restore_target.sql
-          echo "✅ message 表恢复完成"
+          echo "✅ 恢复完成"
