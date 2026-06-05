@@ -51,7 +51,6 @@ jobs:
         run: |
           python3 - <<'PYEOF'
           import os
-          import re
           import math
           import time
           import sqlite3
@@ -74,7 +73,6 @@ jobs:
           except Exception:
               max_batch_bytes = 500000
 
-          # 单条 SQL 最大大小。超过这个一般 D1 API 也容易失败。
           MAX_STMT_BYTES = 900_000
 
           SKIP_TABLES = {
@@ -108,10 +106,10 @@ jobs:
 
               s = str(value)
 
-              # SQLite/D1 对 NUL 字符支持不好，避免生成无法解析的 SQL
+              # D1/SQLite SQL 文本里不适合直接出现 NUL
               s = s.replace('\x00', '')
 
-              # SQL 字符串单引号转义
+              # 单引号转义
               s = s.replace("'", "''")
 
               return "'" + s + "'"
@@ -124,13 +122,21 @@ jobs:
           conn = sqlite3.connect('./restore.db')
           conn.execute('PRAGMA foreign_keys = OFF;')
 
-          with open('./backup.sql', 'r', encoding='utf-8', errors='replace') as f:
-              backup_sql = f.read()
+          # 关键修复：用二进制读取，并移除 NUL 空字符
+          with open('./backup.sql', 'rb') as f:
+              raw = f.read()
+
+          nul_count = raw.count(b'\x00')
+          if nul_count:
+              print(f"⚠️ 检测到 NUL 空字符: {nul_count} 个，已自动移除")
+              raw = raw.replace(b'\x00', b'')
+
+          backup_sql = raw.decode('utf-8', errors='replace')
 
           try:
               conn.executescript(backup_sql)
               conn.commit()
-          except Exception as e:
+          except Exception:
               print("❌ backup.sql 无法导入本地 SQLite。")
               print("这通常说明备份文件本身不是完整 SQLite dump，或者其中存在损坏 SQL。")
               print("")
@@ -187,8 +193,6 @@ jobs:
 
               original_columns = [row[1] for row in table_info]
               select_columns = original_columns[:]
-
-              # message 表兼容 sent_at
               output_columns = original_columns[:]
 
               message_need_append_sent_at = False
@@ -202,7 +206,6 @@ jobs:
                   if 'sent_at' in original_columns:
                       message_sent_at_index = original_columns.index('sent_at')
                   else:
-                      # 备份里没有 sent_at，但目标表可能要求 sent_at
                       output_columns.append('sent_at')
                       message_need_append_sent_at = True
 
@@ -230,7 +233,6 @@ jobs:
                           if message_need_append_sent_at:
                               values.append(fill_val)
                           else:
-                              # 只修 sent_at 自己为 NULL 的情况，不再全局替换 NULL
                               if message_sent_at_index is not None and values[message_sent_at_index] is None:
                                   values[message_sent_at_index] = fill_val
 
@@ -245,7 +247,6 @@ jobs:
                           skipped_large += 1
                           continue
 
-                      # 同时按条数和字节数分批，避免 D1 API 请求过大
                       if current_batch and (
                           current_count >= batch_size or
                           current_bytes + stmt_bytes > max_batch_bytes
@@ -269,6 +270,7 @@ jobs:
                   f.writelines(batch)
 
           total_rows = sum(counts.values())
+
           print("")
           print(f"恢复范围: {'全部表' if not target_tables else ', '.join(target_tables)}")
           print(f"合计待恢复: {total_rows} 条")
