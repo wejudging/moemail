@@ -24,8 +24,10 @@ jobs:
           echo "📄 备份总行数: $(wc -l < ./backup.sql) 行"
       - name: Extract message table
         run: |
+          CURRENT_TIME=$(date -u '+%Y-%m-%d %H:%M:%S')
           grep -i 'INSERT INTO.*["`]message["`]' ./backup.sql \
             | sed 's/INSERT INTO/INSERT OR REPLACE INTO/gi' \
+            | sed "s/,NULL,/,'${CURRENT_TIME}',/g" \
             > ./restore_target.sql
           echo "📄 message 表记录数: $(wc -l < ./restore_target.sql) 行"
       - name: Install Wrangler
