@@ -18,10 +18,20 @@ on:
         type: string
         default: '20'
       max_batch_bytes:
-        description: '每批最大 SQL 大小，单位字节（默认500000）'
+        description: '每批最大 SQL 大小，单位字节（默认80000）'
         required: false
         type: string
-        default: '500000'
+        default: '80000'
+      max_stmt_bytes:
+        description: '单条 SQL 最大大小，单位字节（默认90000）'
+        required: false
+        type: string
+        default: '90000'
+      oversized_action:
+        description: '超大记录处理方式：truncate=截断大字段，skip=跳过'
+        required: false
+        type: string
+        default: 'truncate'
 
 permissions:
   actions: read
@@ -48,6 +58,8 @@ jobs:
           TABLES: ${{ inputs.tables }}
           BATCH_SIZE: ${{ inputs.batch_size }}
           MAX_BATCH_BYTES: ${{ inputs.max_batch_bytes }}
+          MAX_STMT_BYTES: ${{ inputs.max_stmt_bytes }}
+          OVERSIZED_ACTION: ${{ inputs.oversized_action }}
         run: |
           python3 - <<'PYEOF'
           import os
@@ -59,21 +71,22 @@ jobs:
           tables_input = os.environ.get('TABLES', '').strip()
           target_tables = [t.strip().strip('"').strip("'") for t in tables_input.split(',') if t.strip()] if tables_input else []
 
-          try:
-              batch_size = int(os.environ.get('BATCH_SIZE', '20').strip())
-              if batch_size <= 0:
-                  batch_size = 20
-          except Exception:
-              batch_size = 20
+          def parse_int_env(name, default):
+              try:
+                  v = int(os.environ.get(name, str(default)).strip())
+                  if v <= 0:
+                      return default
+                  return v
+              except Exception:
+                  return default
 
-          try:
-              max_batch_bytes = int(os.environ.get('MAX_BATCH_BYTES', '500000').strip())
-              if max_batch_bytes <= 0:
-                  max_batch_bytes = 500000
-          except Exception:
-              max_batch_bytes = 500000
+          batch_size = parse_int_env('BATCH_SIZE', 20)
+          max_batch_bytes = parse_int_env('MAX_BATCH_BYTES', 80000)
+          max_stmt_bytes = parse_int_env('MAX_STMT_BYTES', 90000)
 
-          MAX_STMT_BYTES = 900_000
+          oversized_action = os.environ.get('OVERSIZED_ACTION', 'truncate').strip().lower()
+          if oversized_action not in ('truncate', 'skip'):
+              oversized_action = 'truncate'
 
           SKIP_TABLES = {
               'd1_migrations',
@@ -105,14 +118,71 @@ jobs:
                   return "X'" + value.hex() + "'"
 
               s = str(value)
-
-              # D1/SQLite SQL 文本里不适合直接出现 NUL
               s = s.replace('\x00', '')
-
-              # 单引号转义
               s = s.replace("'", "''")
-
               return "'" + s + "'"
+
+          def build_insert_stmt(table, columns, values):
+              columns_sql = ','.join(quote_ident(c) for c in columns)
+              values_sql = ','.join(sql_literal(v) for v in values)
+              return f'INSERT OR REPLACE INTO {quote_ident(table)} ({columns_sql}) VALUES({values_sql});\n'
+
+          def truncate_value(v, max_chars, label=''):
+              if v is None:
+                  return v
+
+              if isinstance(v, bytes):
+                  return v[:max_chars]
+
+              s = str(v)
+              if len(s) <= max_chars:
+                  return v
+
+              suffix = f"\n\n[TRUNCATED BY RESTORE WORKFLOW: {label}, original_chars={len(s)}]"
+              keep = max(0, max_chars - len(suffix))
+              return s[:keep] + suffix
+
+          def try_shrink_message(table, columns, values):
+              """
+              针对 message 表的大字段做截断。
+              主要是 html 字段过大导致 D1 SQLITE_TOOBIG。
+              """
+              if table != 'message':
+                  return values, False
+
+              values = list(values)
+              changed = False
+
+              col_index = {c: i for i, c in enumerate(columns)}
+
+              # 优先截断 html，因为通常最大
+              if 'html' in col_index:
+                  i = col_index['html']
+                  old = values[i]
+                  new = truncate_value(old, 30000, 'message.html')
+                  if new != old:
+                      values[i] = new
+                      changed = True
+
+              # 如果 content 也很大，截断
+              if 'content' in col_index:
+                  i = col_index['content']
+                  old = values[i]
+                  new = truncate_value(old, 10000, 'message.content')
+                  if new != old:
+                      values[i] = new
+                      changed = True
+
+              # subject 正常不会很大，但保险处理
+              if 'subject' in col_index:
+                  i = col_index['subject']
+                  old = values[i]
+                  new = truncate_value(old, 1000, 'message.subject')
+                  if new != old:
+                      values[i] = new
+                      changed = True
+
+              return values, changed
 
           print("📥 正在把 backup.sql 导入本地临时 SQLite，用于规范化数据...")
 
@@ -122,7 +192,6 @@ jobs:
           conn = sqlite3.connect('./restore.db')
           conn.execute('PRAGMA foreign_keys = OFF;')
 
-          # 关键修复：用二进制读取，并移除 NUL 空字符
           with open('./backup.sql', 'rb') as f:
               raw = f.read()
 
@@ -138,8 +207,6 @@ jobs:
               conn.commit()
           except Exception:
               print("❌ backup.sql 无法导入本地 SQLite。")
-              print("这通常说明备份文件本身不是完整 SQLite dump，或者其中存在损坏 SQL。")
-              print("")
               print("错误信息：")
               traceback.print_exc()
               raise
@@ -173,6 +240,7 @@ jobs:
 
           counts = {}
           skipped_large = 0
+          truncated_large = 0
           skipped_empty_table = 0
 
           def flush_batch():
@@ -236,17 +304,30 @@ jobs:
                               if message_sent_at_index is not None and values[message_sent_at_index] is None:
                                   values[message_sent_at_index] = fill_val
 
-                      columns_sql = ','.join(quote_ident(c) for c in output_columns)
-                      values_sql = ','.join(sql_literal(v) for v in values)
-
-                      stmt = f'INSERT OR REPLACE INTO {quote_ident(table)} ({columns_sql}) VALUES({values_sql});\n'
-
+                      stmt = build_insert_stmt(table, output_columns, values)
                       stmt_bytes = len(stmt.encode('utf-8'))
 
-                      if stmt_bytes > MAX_STMT_BYTES:
-                          skipped_large += 1
-                          continue
+                      if stmt_bytes > max_stmt_bytes:
+                          if oversized_action == 'truncate':
+                              new_values, changed = try_shrink_message(table, output_columns, values)
 
+                              if changed:
+                                  stmt = build_insert_stmt(table, output_columns, new_values)
+                                  stmt_bytes = len(stmt.encode('utf-8'))
+
+                                  if stmt_bytes <= max_stmt_bytes:
+                                      truncated_large += 1
+                                  else:
+                                      skipped_large += 1
+                                      continue
+                              else:
+                                  skipped_large += 1
+                                  continue
+                          else:
+                              skipped_large += 1
+                              continue
+
+                      # 如果单条 SQL 仍然比批次限制大，单独成批
                       if current_batch and (
                           current_count >= batch_size or
                           current_bytes + stmt_bytes > max_batch_bytes
@@ -256,6 +337,10 @@ jobs:
                       current_batch.append(stmt)
                       current_count += 1
                       current_bytes += stmt_bytes
+
+                      # 单条已经接近或超过批大小，立即 flush，避免和下一条合并
+                      if current_bytes >= max_batch_bytes:
+                          flush_batch()
 
                       row_count += 1
                       counts[table] = counts.get(table, 0) + 1
@@ -277,9 +362,14 @@ jobs:
           print(f"分批数量: {len(all_batches)} 批")
           print(f"每批最多语句数: {batch_size}")
           print(f"每批最大字节数: {max_batch_bytes}")
+          print(f"单条最大字节数: {max_stmt_bytes}")
+          print(f"超大记录处理方式: {oversized_action}")
+
+          if truncated_large:
+              print(f"⚠️ 已截断超大记录: {truncated_large} 条")
 
           if skipped_large:
-              print(f"⚠️ 跳过超大记录: {skipped_large} 条")
+              print(f"⚠️ 已跳过仍然过大的记录: {skipped_large} 条")
 
           if skipped_empty_table:
               print(f"⚠️ 跳过空结构表: {skipped_empty_table} 个")
@@ -339,12 +429,16 @@ jobs:
               echo "$BODY"
 
               echo ""
-              echo "======= 失败 batch 文件前 40 行 ======="
-              sed -n '1,40p' "$batch_file" || true
+              echo "======= 失败 batch 文件大小 ======="
+              wc -c "$batch_file" || true
 
               echo ""
-              echo "======= 失败 batch 文件后 40 行 ======="
-              tail -n 40 "$batch_file" || true
+              echo "======= 失败 batch 文件前 20 行 ======="
+              sed -n '1,20p' "$batch_file" || true
+
+              echo ""
+              echo "======= 失败 batch 文件后 20 行 ======="
+              tail -n 20 "$batch_file" || true
 
               exit 1
             fi
@@ -356,12 +450,16 @@ jobs:
               echo "$BODY"
 
               echo ""
-              echo "======= 失败 batch 文件前 40 行 ======="
-              sed -n '1,40p' "$batch_file" || true
+              echo "======= 失败 batch 文件大小 ======="
+              wc -c "$batch_file" || true
 
               echo ""
-              echo "======= 失败 batch 文件后 40 行 ======="
-              tail -n 40 "$batch_file" || true
+              echo "======= 失败 batch 文件前 20 行 ======="
+              sed -n '1,20p' "$batch_file" || true
+
+              echo ""
+              echo "======= 失败 batch 文件后 20 行 ======="
+              tail -n 20 "$batch_file" || true
 
               exit 1
             fi
