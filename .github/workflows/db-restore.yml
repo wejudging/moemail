@@ -32,37 +32,6 @@ jobs:
         run: |
           gunzip ./backup.sql.gz
           echo "📄 备份文件大小: $(du -sh backup.sql | cut -f1)"
-      - name: Debug - show message rows with NULL
-        run: |
-          python3 - <<'PYEOF'
-          import re
-
-          content = open('./backup.sql', encoding='utf-8', errors='replace').read()
-          statements = re.split(r';\s*\n', content)
-
-          found = 0
-          for stmt in statements:
-              stmt = stmt.strip()
-              if not re.match(r'INSERT INTO\s+"?message"?\s', stmt, re.IGNORECASE):
-                  continue
-              if 'NULL' in stmt:
-                  print(f"=== 含NULL的message记录 #{found+1} ===")
-                  print(stmt[:800])
-                  print("---")
-                  found += 1
-                  if found >= 2:
-                      break
-
-          if found == 0:
-              print("没有找到含NULL的message记录")
-              # 打印一条正常记录作为参考
-              for stmt in statements:
-                  stmt = stmt.strip()
-                  if re.match(r'INSERT INTO\s+"?message"?\s', stmt, re.IGNORECASE):
-                      print("=== 正常message记录示例 ===")
-                      print(stmt[:800])
-                      break
-          PYEOF
       - name: Prepare restore files
         env:
           TABLES: ${{ inputs.tables }}
@@ -98,9 +67,20 @@ jobs:
               stmt = re.sub(r'^INSERT INTO', 'INSERT OR REPLACE INTO', stmt, flags=re.IGNORECASE)
 
               if table_name == 'message':
-                  received_at_match = re.search(r',(\d{13})[,)]', stmt)
-                  fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
-                  stmt = re.sub(r'\bNULL\b', fill_val, stmt)
+                  if '"sent_at"' not in stmt:
+                      # 列定义里没有 sent_at，需要补列名和值
+                      # 在最后一个列名后补 ,"sent_at"
+                      stmt = re.sub(r'\)\s*VALUES', ',"sent_at") VALUES', stmt, count=1)
+                      # 提取 received_at 值作为 sent_at，兜底用当前时间戳
+                      received_at_match = re.search(r',(\d{13})[,)]', stmt)
+                      fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
+                      # 在 VALUES 最后一个 ) 前插入值
+                      stmt = re.sub(r'\)\s*$', f',{fill_val})', stmt.rstrip())
+                  else:
+                      # 列存在但值可能为 NULL
+                      received_at_match = re.search(r',(\d{13})[,)]', stmt)
+                      fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
+                      stmt = re.sub(r'\bNULL\b', fill_val, stmt)
 
               all_stmts.append(stmt + ';\n')
               counts[table_name] = counts.get(table_name, 0) + 1
