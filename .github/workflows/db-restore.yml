@@ -44,11 +44,15 @@ jobs:
           target_tables = [t.strip().strip('"') for t in tables_input.split(',') if t.strip()] if tables_input else []
           batch_size = int(os.environ.get('BATCH_SIZE', '500'))
 
+          # D1 单条语句上限约 1MB
+          MAX_STMT_BYTES = 900_000
+
           content = open('./backup.sql', encoding='utf-8', errors='replace').read()
           statements = re.split(r';\s*\n', content)
 
           all_stmts = []
           counts = {}
+          skipped = 0
           fallback_ts = int(time.time() * 1000)
 
           for stmt in statements:
@@ -68,25 +72,26 @@ jobs:
 
               if table_name == 'message':
                   if '"sent_at"' not in stmt:
-                      # 列定义里没有 sent_at，需要补列名和值
-                      # 在最后一个列名后补 ,"sent_at"
                       stmt = re.sub(r'\)\s*VALUES', ',"sent_at") VALUES', stmt, count=1)
-                      # 提取 received_at 值作为 sent_at，兜底用当前时间戳
                       received_at_match = re.search(r',(\d{13})[,)]', stmt)
                       fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
-                      # 在 VALUES 最后一个 ) 前插入值
                       stmt = re.sub(r'\)\s*$', f',{fill_val})', stmt.rstrip())
                   else:
-                      # 列存在但值可能为 NULL
                       received_at_match = re.search(r',(\d{13})[,)]', stmt)
                       fill_val = received_at_match.group(1) if received_at_match else str(fallback_ts)
                       stmt = re.sub(r'\bNULL\b', fill_val, stmt)
+
+              # 跳过超长语句（D1 限制）
+              if len(stmt.encode('utf-8')) > MAX_STMT_BYTES:
+                  skipped += 1
+                  print(f"⚠️  跳过超长记录 ({len(stmt.encode('utf-8'))//1024}KB): {table_name}")
+                  continue
 
               all_stmts.append(stmt + ';\n')
               counts[table_name] = counts.get(table_name, 0) + 1
 
           total = len(all_stmts)
-          num_batches = math.ceil(total / batch_size)
+          num_batches = math.ceil(total / batch_size) if total else 0
           os.makedirs('./batches', exist_ok=True)
 
           for i in range(num_batches):
@@ -100,6 +105,8 @@ jobs:
           for t, c in sorted(counts.items()):
               print(f"  {t}: {c} 条")
           print(f"合计: {total} 条，分 {num_batches} 批（每批 {batch_size} 条）")
+          if skipped:
+              print(f"⚠️  跳过超长记录: {skipped} 条（邮件 HTML 内容超过 D1 限制）")
           PYEOF
 
       - name: Install Wrangler
