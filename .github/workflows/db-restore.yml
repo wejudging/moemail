@@ -12,7 +12,7 @@ on:
         type: string
         default: ''
       batch_size:
-        description: '每批导入的语句数（默认500，数据量大时可适当调小）'
+        description: '每批导入的语句数（默认500，超时可调小）'
         required: false
         type: string
         default: '500'
@@ -62,11 +62,19 @@ jobs:
                   continue
               if table_name in ('d1_migrations', 'sqlite_sequence', '_cf_KV'):
                   continue
+
               stmt = re.sub(r'^INSERT INTO', 'INSERT OR REPLACE INTO', stmt, flags=re.IGNORECASE)
+
+              # 修复 message.sent_at 为 NULL，用 received_at 时间戳填充
+              if table_name == 'message':
+                  received_at_match = re.search(r',(\d{13}),', stmt)
+                  if received_at_match:
+                      received_at_val = received_at_match.group(1)
+                      stmt = re.sub(r'\bNULL\b', received_at_val, stmt)
+
               all_stmts.append(stmt + ';\n')
               counts[table_name] = counts.get(table_name, 0) + 1
 
-          # 分批写文件
           total = len(all_stmts)
           num_batches = math.ceil(total / batch_size)
           os.makedirs('./batches', exist_ok=True)
