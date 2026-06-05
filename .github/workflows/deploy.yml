@@ -33,7 +33,9 @@ jobs:
           cache: 'pnpm'
 
       - name: Install Dependencies
-        run: pnpm install --no-frozen-lockfile
+        run: 
+          pnpm install --no-frozen-lockfile
+          pnpm add -D @cloudflare/next-on-pages@latest wrangler@latest
 
       - name: Run deploy script
         env:
